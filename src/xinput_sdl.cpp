@@ -1,12 +1,12 @@
 // xinput-sdl-wrapper
 // A drop-in XInput DLL (xinput1_3 / xinput1_4 / xinput9_1_0) that sources its
-// data from SDL3's Gamepad API, so any SDL-supported pad works in games
+// data from SDL3's gamepad API, so any SDL-supported pad works in games
 // that only speak XInput.
 
 #include "xinput_types.h"
+#include "dinput_hide.h"
 #include <SDL3/SDL.h>
 
-#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
@@ -16,10 +16,10 @@ constexpr int kMaxPads = 4;
 
 struct Slot {
     SDL_Gamepad*   pad = nullptr;
-    SDL_JoystickID id = 0;  // SDL3: instance IDs are Uint32, 0 is invalid
-    DWORD          packet = 0;
-    XINPUT_GAMEPAD last = {};
-    WORD           lastLow = 0, lastHigh = 0;
+    SDL_JoystickID id = 0;          // 0 is never a valid SDL3 instance ID
+    DWORD               packet = 0;
+    XINPUT_GAMEPAD      last = {};
+    WORD                lastLow = 0, lastHigh = 0;
 };
 
 struct Config {
@@ -56,22 +56,22 @@ void ModuleDir(char* out, size_t n) {
 
 // ---- slot management (call with g_lock held) ------------------------------
 
-int FindSlotById(SDL_JoystickID id) {
+int FindSlotByPad(SDL_Gamepad* p) {
     for (int i = 0; i < kMaxPads; ++i)
-        if (g_slots[i].pad && g_slots[i].id == id) return i;
+        if (g_slots[i].pad == p) return i;
     return -1;
 }
 
-// SDL3: the "device index" of SDL2 is now the joystick instance ID.
-void OpenDevice(SDL_JoystickID id) {
-    if (FindSlotById(id) >= 0) return;  // already tracked (don't bump SDL's refcount)
-    SDL_Gamepad* pad = SDL_OpenGamepad(id);
+// In SDL3 the ADDED event carries the joystick instance ID directly.
+void OpenDevice(SDL_JoystickID instanceId) {
+    SDL_Gamepad* pad = SDL_OpenGamepad(instanceId);
     if (!pad) return;
+    if (FindSlotByPad(pad) >= 0) return;  // already tracked (open is ref-counted)
     for (int i = 0; i < kMaxPads; ++i) {
         if (!g_slots[i].pad) {
             g_slots[i] = Slot{};
             g_slots[i].pad = pad;
-            g_slots[i].id = id;
+            g_slots[i].id = instanceId;
             Log("'%s' -> slot %d", SDL_GetGamepadName(pad), i);
             return;
         }
@@ -130,27 +130,24 @@ BOOL CALLBACK InitOnceFn(PINIT_ONCE, PVOID, PVOID*) {
     // We don't own a window; keep delivering input when the game is unfocused.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 
-    // SDL3: SDL_Init returns true on success.
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
+    if (!SDL_Init(SDL_INIT_GAMEPAD)) {  // SDL3: returns true on success
         Log("SDL_Init failed: %s", SDL_GetError());
         g_sdlOk = false;
         return TRUE;
     }
     g_sdlOk = true;
 
+    // Hide gamepad-class devices from the game's DirectInput enumeration so it
+    // only sees the pad through XInput. Safe here (not under loader lock); SDL's
+    // own DirectInput use is exempted by caller module inside the hooks.
+    InstallDInputHooks(g_cfg.debug);
+
     // Optional user-supplied mappings (https://github.com/mdqinc/SDL_GameControllerDB)
     if (GetFileAttributesA(db) != INVALID_FILE_ATTRIBUTES)
         SDL_AddGamepadMappingsFromFile(db);
 
     EnterCriticalSection(&g_lock);
-    // Pick up already-connected pads explicitly (duplicates from the
-    // DEVICE_ADDED events SDL also queues are filtered in OpenDevice).
-    int count = 0;
-    if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
-        for (int i = 0; i < count; ++i) OpenDevice(ids[i]);
-        SDL_free(ids);
-    }
-    Pump(true);
+    Pump(true);  // picks up already-connected pads via DEVICEADDED events
     LeaveCriticalSection(&g_lock);
     return TRUE;
 }
@@ -175,16 +172,16 @@ void Translate(SDL_Gamepad* c, bool withGuide, XINPUT_GAMEPAD& g) {
         {SDL_GAMEPAD_BUTTON_DPAD_RIGHT,    XINPUT_GAMEPAD_DPAD_RIGHT},
         {SDL_GAMEPAD_BUTTON_START,         XINPUT_GAMEPAD_START},
         {SDL_GAMEPAD_BUTTON_BACK,          XINPUT_GAMEPAD_BACK},
-        {SDL_GAMEPAD_BUTTON_LEFT_STICK,    XINPUT_GAMEPAD_LEFT_THUMB},
-        {SDL_GAMEPAD_BUTTON_RIGHT_STICK,   XINPUT_GAMEPAD_RIGHT_THUMB},
-        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER},
-        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,XINPUT_GAMEPAD_RIGHT_SHOULDER},
+        {SDL_GAMEPAD_BUTTON_LEFT_STICK,     XINPUT_GAMEPAD_LEFT_THUMB},
+        {SDL_GAMEPAD_BUTTON_RIGHT_STICK,    XINPUT_GAMEPAD_RIGHT_THUMB},
+        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,  XINPUT_GAMEPAD_LEFT_SHOULDER},
+        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER},
     };
     WORD b = 0;
     for (const Map& m : map)
         if (SDL_GetGamepadButton(c, m.sdl)) b |= m.xi;
 
-    // SDL3 face buttons are positional: SOUTH=A, EAST=B, WEST=X, NORTH=Y (Xbox layout).
+    // SDL3 names buttons by position: SOUTH=A, EAST=B, WEST=X, NORTH=Y (Xbox labels).
     SDL_GamepadButton bA = SDL_GAMEPAD_BUTTON_SOUTH, bB = SDL_GAMEPAD_BUTTON_EAST;
     SDL_GamepadButton bX = SDL_GAMEPAD_BUTTON_WEST,  bY = SDL_GAMEPAD_BUTTON_NORTH;
     if (g_cfg.swapAB) { bA = SDL_GAMEPAD_BUTTON_EAST;  bB = SDL_GAMEPAD_BUTTON_SOUTH;
@@ -245,7 +242,7 @@ DWORD WINAPI XInputSetState(DWORD idx, XINPUT_VIBRATION* v) {
     s.lastHigh = v->wRightMotorSpeed;
     // XInput: left = low-frequency (big) motor, right = high-frequency (small) motor.
     SDL_RumbleGamepad(s.pad, v->wLeftMotorSpeed, v->wRightMotorSpeed,
-                      (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 0xFFFF : 0);
+                             (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 0xFFFF : 0);
     return ERROR_SUCCESS;
 }
 
