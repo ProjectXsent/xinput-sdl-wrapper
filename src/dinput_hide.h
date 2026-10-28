@@ -4,3 +4,7 @@
 
 // Returns true if the DirectInput hooks were installed.
 bool InstallDInputHooks(bool debug);
+
+// Shared log sink, defined in xinput_sdl.cpp. Writes the line (which should
+// already end in '\n') to OutputDebugString and to xinput_sdl.log.
+void LogWrite(const char* line);

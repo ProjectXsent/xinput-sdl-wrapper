@@ -21,6 +21,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -37,14 +38,14 @@ bool g_debug = false;
 
 void Log(const char* fmt, ...) {
     if (!g_debug) return;
-    char buf[512];
+    char msg[480];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    strcat(buf, "\n");
-    OutputDebugStringA("[xinput-sdl/dinput] ");
-    OutputDebugStringA(buf);
+    char line[512];
+    snprintf(line, sizeof(line), "[dinput] %s\n", msg);
+    LogWrite(line);
 }
 
 // ---- policy ---------------------------------------------------------------
@@ -91,6 +92,12 @@ bool CallerIsExempt(void* retAddr) {
 // inside such a call and pass straight through; the outermost call has already
 // done the filtering. Callbacks into game code reset depth to 0 (see thunks) so
 // that a game calling DirectInput from inside its enum callback is still filtered.
+// Vtables of the real A/W interfaces, so shared detours can tell which flavour
+// of object they were called on (see IsHiddenGuidAny).
+void** g_vtA = nullptr;
+void** g_vtW = nullptr;
+bool IsHiddenGuidAny(void* self, REFGUID g, bool fallbackW);
+
 thread_local int t_depth = 0;
 struct Guard { Guard() { ++t_depth; } ~Guard() { --t_depth; } };
 
@@ -176,6 +183,7 @@ struct H {
     // EnumDevices so it sees everything.
     static bool IsHiddenGuid(I* self, REFGUID g) {
         if (IsSystemGuid(g)) return false;
+        if (!oEnum) return false;
         FindCtx fc = { &g, false, false };
         Guard guard;
         oEnum(self, DI8DEVCLASS_ALL, FindThunk<Tr>, &fc, DIEDFL_ALLDEVICES);
@@ -211,7 +219,7 @@ struct H {
             typename Tr::DevOut* out, LPUNKNOWN outer) {
         void* ret = RETADDR();
         if (t_depth == 0 && !IsSystemGuid(guid) && !CallerIsExempt(ret) &&
-            IsHiddenGuid(self, guid)) {
+            IsHiddenGuidAny(self, guid, std::is_same<Tr, TraitsW>::value)) {
             Log("CreateDevice blocked");
             if (out) *out = nullptr;
             return DIERR_DEVICENOTREG;
@@ -223,12 +231,22 @@ struct H {
     static NOINLINE HRESULT STDMETHODCALLTYPE GetDeviceStatus(I* self, REFGUID guid) {
         void* ret = RETADDR();
         if (t_depth == 0 && !IsSystemGuid(guid) && !CallerIsExempt(ret) &&
-            IsHiddenGuid(self, guid))
+            IsHiddenGuidAny(self, guid, std::is_same<Tr, TraitsW>::value))
             return DI_NOTATTACHED;
         Guard g;
         return oStatus(self, guid);
     }
 };
+
+// GetDeviceStatus (and possibly others) can be one shared function for the A and W
+// interfaces, in which case only one detour exists and it receives both kinds of
+// object. Pick the right original EnumDevices by looking at the object's vtable.
+bool IsHiddenGuidAny(void* self, REFGUID g, bool fallbackW) {
+    void** vt = *(void***)self;
+    bool useW = (vt == g_vtW) ? true : (vt == g_vtA) ? false : fallbackW;
+    return useW ? H<TraitsW>::IsHiddenGuid((IDirectInput8W*)self, g)
+                : H<TraitsA>::IsHiddenGuid((IDirectInput8A*)self, g);
+}
 
 // ---- installation ---------------------------------------------------------
 
@@ -239,6 +257,11 @@ constexpr int kVtEnumDevicesBySemantics = 9;
 
 bool HookOne(void* target, void* detour, void** orig, const char* what) {
     MH_STATUS s = MH_CreateHook(target, detour, orig);
+    if (s == MH_ERROR_ALREADY_CREATED) {
+        // The A and W interfaces share this function; the first detour handles both.
+        Log("%s is shared with the other interface (already hooked)", what);
+        return true;
+    }
     if (s != MH_OK) { Log("MH_CreateHook(%s) failed: %s", what, MH_StatusToString(s)); return false; }
     s = MH_EnableHook(target);
     if (s != MH_OK) { Log("MH_EnableHook(%s) failed: %s", what, MH_StatusToString(s)); return false; }
@@ -261,6 +284,7 @@ bool HookInterface(DirectInput8Create_t create) {
     void* tStatus = vt[kVtGetDeviceStatus];
     void* tSem    = vt[kVtEnumDevicesBySemantics];
     obj->Release();              // dinput8.dll stays loaded; vtable is static data
+    if constexpr (std::is_same<Tr, TraitsA>::value) g_vtA = vt; else g_vtW = vt;
 
     using HH = H<Tr>;
     bool ok = true;

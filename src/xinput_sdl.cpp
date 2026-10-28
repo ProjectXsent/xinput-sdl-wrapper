@@ -7,6 +7,7 @@
 #include "dinput_hide.h"
 #include <SDL3/SDL.h>
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 
@@ -18,7 +19,7 @@ struct Slot {
     SDL_Gamepad*   pad = nullptr;
     SDL_JoystickID id = 0;          // 0 is never a valid SDL3 instance ID
     DWORD               packet = 0;
-    XINPUT_GAMEPAD      last = {};
+    XINPUT_GAMEPAD      last = {};      // latest state, always translated WITH the guide bit
     WORD                lastLow = 0, lastHigh = 0;
 };
 
@@ -26,6 +27,7 @@ struct Config {
     bool swapAB = false;
     bool rumble = true;
     bool debug = false;
+    int  sdlXInput = -1;   // -1 auto, 0 off, 1 on (SDL's own use of the real XInput)
 };
 
 HMODULE          g_module = nullptr;
@@ -34,18 +36,40 @@ CRITICAL_SECTION g_lock;
 bool             g_sdlOk = false;
 Config           g_cfg;
 Slot             g_slots[kMaxPads];
-LARGE_INTEGER    g_freq = {}, g_lastPump = {};
+LARGE_INTEGER    g_freq = {};
+HANDLE           g_ready = nullptr;      // signalled when the worker finished init
+char             g_logPath[MAX_PATH + 32] = {};
+bool             g_loggedFirstCall = false;
+
+}  // namespace
+
+// Shared by dinput_hide.cpp. Appends to xinput_sdl.log and the debugger channel.
+void LogWrite(const char* line) {
+    OutputDebugStringA(line);
+    if (!g_logPath[0]) return;
+    HANDLE h = CreateFileA(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD n;
+    WriteFile(h, line, (DWORD)strlen(line), &n, nullptr);
+    CloseHandle(h);
+}
+
+namespace {
 
 void Log(const char* fmt, ...) {
     if (!g_cfg.debug) return;
-    char buf[512];
+    char msg[480];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    strcat(buf, "\n");
-    OutputDebugStringA("[xinput-sdl] ");
-    OutputDebugStringA(buf);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char line[560];
+    snprintf(line, sizeof(line), "%02d:%02d:%02d.%03d [xinput-sdl] %s\n",
+             t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, msg);
+    LogWrite(line);
 }
 
 void ModuleDir(char* out, size_t n) {
@@ -65,7 +89,7 @@ int FindSlotByPad(SDL_Gamepad* p) {
 // In SDL3 the ADDED event carries the joystick instance ID directly.
 void OpenDevice(SDL_JoystickID instanceId) {
     SDL_Gamepad* pad = SDL_OpenGamepad(instanceId);
-    if (!pad) return;
+    if (!pad) { Log("SDL_OpenGamepad(%u) failed: %s", (unsigned)instanceId, SDL_GetError()); return; }
     if (FindSlotByPad(pad) >= 0) return;  // already tracked (open is ref-counted)
     for (int i = 0; i < kMaxPads; ++i) {
         if (!g_slots[i].pad) {
@@ -90,23 +114,165 @@ void CloseInstance(SDL_JoystickID id) {
     }
 }
 
-// Pump SDL (hot-plug + state refresh), at most every ~2 ms.
-void Pump(bool force = false) {
-    if (!g_sdlOk) return;
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (!force && g_lastPump.QuadPart &&
-        (now.QuadPart - g_lastPump.QuadPart) * 1000 < g_freq.QuadPart * 2)
-        return;
-    g_lastPump = now;
+// Log calls that took suspiciously long (capped so the log stays readable).
+void LogIfSlow(const char* what, LARGE_INTEGER start) {
+    static LONG count = 0;
+    LARGE_INTEGER end;
+    QueryPerformanceCounter(&end);
+    double ms = (double)(end.QuadPart - start.QuadPart) * 1000.0 / (double)g_freq.QuadPart;
+    if (ms >= 8.0 && InterlockedIncrement(&count) <= 100)
+        Log("SLOW: %s took %.1f ms (thread %lu)", what, ms, GetCurrentThreadId());
+}
 
+void Translate(SDL_Gamepad* c, bool withGuide, XINPUT_GAMEPAD& g);
+
+// Pump SDL (hot-plug + state refresh). Called only from the worker thread,
+// with g_lock held.
+void Pump() {
     SDL_PumpEvents();
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED)        OpenDevice(e.gdevice.which);
-        else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) CloseInstance(e.gdevice.which);
+        switch (e.type) {
+        case SDL_EVENT_JOYSTICK_ADDED:
+            Log("JOYSTICK_ADDED id=%u '%s' isGamepad=%d", (unsigned)e.jdevice.which,
+                SDL_GetJoystickNameForID(e.jdevice.which) ? SDL_GetJoystickNameForID(e.jdevice.which) : "?",
+                (int)SDL_IsGamepad(e.jdevice.which));
+            break;
+        case SDL_EVENT_JOYSTICK_REMOVED:
+            Log("JOYSTICK_REMOVED id=%u", (unsigned)e.jdevice.which);
+            break;
+        case SDL_EVENT_GAMEPAD_ADDED:
+            Log("GAMEPAD_ADDED id=%u", (unsigned)e.gdevice.which);
+            OpenDevice(e.gdevice.which);
+            break;
+        case SDL_EVENT_GAMEPAD_REMOVED:
+            Log("GAMEPAD_REMOVED id=%u", (unsigned)e.gdevice.which);
+            CloseInstance(e.gdevice.which);
+            break;
+        default: break;
+        }
     }
     SDL_UpdateGamepads();
+
+    // Refresh the cached XInput state of every slot.
+    for (int i = 0; i < kMaxPads; ++i) {
+        Slot& s = g_slots[i];
+        if (!s.pad) continue;
+        XINPUT_GAMEPAD cur = {};
+        Translate(s.pad, true, cur);
+        if (std::memcmp(&cur, &s.last, sizeof(cur)) != 0) {
+            s.last = cur;
+            ++s.packet;
+        }
+    }
+}
+
+bool ModuleIsXInput14() {
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_module, path, MAX_PATH);
+    const char* base = strrchr(path, '\\');
+    base = base ? base + 1 : path;
+    return _stricmp(base, "xinput1_4.dll") == 0;
+}
+
+void DumpDevices() {
+    int n = 0;
+    SDL_JoystickID* js = SDL_GetJoysticks(&n);
+    Log("SDL sees %d joystick(s)", n);
+    for (int i = 0; i < n; ++i) {
+        const char* nm = SDL_GetJoystickNameForID(js[i]);
+        Log("  joystick id=%u '%s' isGamepad=%d", (unsigned)js[i], nm ? nm : "?", (int)SDL_IsGamepad(js[i]));
+    }
+    SDL_free(js);
+    SDL_JoystickID* gs = SDL_GetGamepads(&n);
+    Log("SDL sees %d gamepad(s)", n);
+    for (int i = 0; i < n; ++i) OpenDevice(gs[i]);   // no-op if already tracked
+    SDL_free(gs);
+}
+
+// ---- SDL worker thread ----------------------------------------------------
+// All SDL work (init, event pumping, device polling) runs on this private thread,
+// so SDL never touches the game's message queue and the game's thread is never
+// blocked by SDL / HID driver calls. XInputGetState just reads a cached snapshot.
+// NOTE: this thread must NOT call EnsureInit()/Lock (the creator is waiting on us).
+
+void SetOptionalHint(const char* iniKey, const char* sdlHint, const char* ini) {
+    int v = (int)GetPrivateProfileIntA("General", iniKey, -1, ini);
+    if (v >= 0) {
+        SDL_SetHint(sdlHint, v ? "1" : "0");
+        Log("hint %s = %d (ini %s)", sdlHint, v, iniKey);
+    }
+}
+
+char g_ini[MAX_PATH + 32], g_db[MAX_PATH + 32];
+
+DWORD WINAPI WorkerMain(LPVOID) {
+    // SDL's XInput backend is how Xbox pads are normally reached on Windows, so
+    // keep it on. It must only be off when *we* are xinput1_4.dll, because SDL
+    // tries to load XInput1_4.dll first and would find this wrapper (recursion).
+    bool sdlXInput = (g_cfg.sdlXInput >= 0) ? (g_cfg.sdlXInput != 0) : !ModuleIsXInput14();
+    SDL_SetHint(SDL_HINT_XINPUT_ENABLED, sdlXInput ? "1" : "0");
+    Log("SDL_HINT_XINPUT_ENABLED = %d (wrapper is %s)", (int)sdlXInput,
+        ModuleIsXInput14() ? "xinput1_4" : "not xinput1_4");
+    // We don't own a window; keep delivering input when the game is unfocused.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // Optional experiments (ini: RawInput / WGI / HIDAPI = 0 or 1; absent = SDL default)
+    SetOptionalHint("RawInput", SDL_HINT_JOYSTICK_RAWINPUT, g_ini);
+    SetOptionalHint("WGI",      SDL_HINT_JOYSTICK_WGI,      g_ini);
+    SetOptionalHint("HIDAPI",   SDL_HINT_JOYSTICK_HIDAPI,   g_ini);
+
+    if (!SDL_Init(SDL_INIT_GAMEPAD)) {  // SDL3: returns true on success
+        Log("SDL_Init failed: %s", SDL_GetError());
+        g_sdlOk = false;
+        SetEvent(g_ready);
+        return 0;
+    }
+    g_sdlOk = true;
+    {
+        int v = SDL_GetVersion();
+        Log("SDL_Init ok, SDL %d.%d.%d (worker thread %lu)", SDL_VERSIONNUM_MAJOR(v),
+            SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v), GetCurrentThreadId());
+    }
+
+    // Hide gamepad-class devices from the game's DirectInput enumeration so it
+    // only sees the pad through XInput. SDL's own DirectInput use is exempted by
+    // caller module inside the hooks. Done before signalling ready, so the hooks
+    // are in place before the game's first XInput call returns.
+    bool hooked = InstallDInputHooks(g_cfg.debug);
+    Log("DirectInput hooks %s", hooked ? "installed" : "NOT installed");
+
+    // Optional user-supplied mappings (https://github.com/mdqinc/SDL_GameControllerDB)
+    if (GetFileAttributesA(g_db) != INVALID_FILE_ATTRIBUTES) {
+        int added = SDL_AddGamepadMappingsFromFile(g_db);
+        Log("gamecontrollerdb.txt: %d mapping(s) added", added);
+    }
+
+    EnterCriticalSection(&g_lock);
+    Pump();          // picks up already-connected pads via ADDED events
+    DumpDevices();   // log what SDL sees; also opens any gamepad the events missed
+    Pump();          // fill the state cache for anything just opened
+    LeaveCriticalSection(&g_lock);
+    SetEvent(g_ready);
+
+    // ~500 Hz polling. Prefer a high-resolution timer (Win10 1803+); otherwise Sleep(1).
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                       0x00000002 /*CREATE_WAITABLE_TIMER_HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+    for (;;) {
+        if (timer) {
+            LARGE_INTEGER due; due.QuadPart = -20000;  // 2 ms, relative, 100 ns units
+            SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(timer, 50);
+        } else {
+            Sleep(1);
+        }
+        LARGE_INTEGER t0;
+        QueryPerformanceCounter(&t0);
+        EnterCriticalSection(&g_lock);
+        Pump();
+        LeaveCriticalSection(&g_lock);
+        LogIfSlow("Pump", t0);
+    }
+    return 0;
 }
 
 // ---- one-time init --------------------------------------------------------
@@ -115,40 +281,43 @@ BOOL CALLBACK InitOnceFn(PINIT_ONCE, PVOID, PVOID*) {
     InitializeCriticalSection(&g_lock);
     QueryPerformanceFrequency(&g_freq);
 
-    char dir[MAX_PATH], ini[MAX_PATH + 32], db[MAX_PATH + 32];
+    char dir[MAX_PATH];
     ModuleDir(dir, sizeof(dir));
-    snprintf(ini, sizeof(ini), "%sxinput_sdl.ini", dir);
-    snprintf(db, sizeof(db), "%sgamecontrollerdb.txt", dir);
+    snprintf(g_ini, sizeof(g_ini), "%sxinput_sdl.ini", dir);
+    snprintf(g_db, sizeof(g_db), "%sgamecontrollerdb.txt", dir);
 
-    g_cfg.swapAB = GetPrivateProfileIntA("General", "SwapAB", 0, ini) != 0;
-    g_cfg.rumble = GetPrivateProfileIntA("General", "Rumble", 1, ini) != 0;
-    g_cfg.debug  = GetPrivateProfileIntA("General", "Debug", 0, ini) != 0;
+    g_cfg.swapAB = GetPrivateProfileIntA("General", "SwapAB", 0, g_ini) != 0;
+    g_cfg.rumble = GetPrivateProfileIntA("General", "Rumble", 1, g_ini) != 0;
+    g_cfg.debug  = GetPrivateProfileIntA("General", "Debug", 0, g_ini) != 0;
+    // SDLXInput: -1 = auto (default), 0 = never, 1 = always
+    g_cfg.sdlXInput = (int)GetPrivateProfileIntA("General", "SDLXInput", -1, g_ini);
 
-    // CRITICAL: stop SDL from loading xinput1_x.dll itself. It would find *this*
-    // DLL in the game folder and recurse into us.
-    SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "0");
-    // We don't own a window; keep delivering input when the game is unfocused.
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    if (g_cfg.debug) {
+        snprintf(g_logPath, sizeof(g_logPath), "%sxinput_sdl.log", dir);
+        // start a fresh log each run
+        HANDLE h = CreateFileA(g_logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+    {
+        char exe[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        Log("init: host exe = %s", exe);
+        Log("init: wrapper dir = %s (ini %s)", dir,
+            GetFileAttributesA(g_ini) != INVALID_FILE_ATTRIBUTES ? "found" : "NOT found");
+        Log("init: calling thread %lu", GetCurrentThreadId());
+    }
 
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {  // SDL3: returns true on success
-        Log("SDL_Init failed: %s", SDL_GetError());
+    g_ready = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    HANDLE th = CreateThread(nullptr, 0, WorkerMain, nullptr, 0, nullptr);
+    if (!th || !g_ready) {
+        Log("failed to start SDL worker thread (error %lu)", GetLastError());
         g_sdlOk = false;
         return TRUE;
     }
-    g_sdlOk = true;
-
-    // Hide gamepad-class devices from the game's DirectInput enumeration so it
-    // only sees the pad through XInput. Safe here (not under loader lock); SDL's
-    // own DirectInput use is exempted by caller module inside the hooks.
-    InstallDInputHooks(g_cfg.debug);
-
-    // Optional user-supplied mappings (https://github.com/mdqinc/SDL_GameControllerDB)
-    if (GetFileAttributesA(db) != INVALID_FILE_ATTRIBUTES)
-        SDL_AddGamepadMappingsFromFile(db);
-
-    EnterCriticalSection(&g_lock);
-    Pump(true);  // picks up already-connected pads via DEVICEADDED events
-    LeaveCriticalSection(&g_lock);
+    CloseHandle(th);
+    if (WaitForSingleObject(g_ready, 10000) == WAIT_TIMEOUT)
+        Log("WARNING: SDL init still running after 10 s; continuing without waiting");
     return TRUE;
 }
 
@@ -204,19 +373,18 @@ void Translate(SDL_Gamepad* c, bool withGuide, XINPUT_GAMEPAD& g) {
 
 DWORD GetStateImpl(DWORD idx, XINPUT_STATE* st, bool withGuide) {
     if (!st || idx >= kMaxPads) return ERROR_BAD_ARGUMENTS;
+    EnsureInit();
+    if (!g_loggedFirstCall) { g_loggedFirstCall = true; Log("first XInputGetState call by the game (thread %lu)", GetCurrentThreadId()); }
+    LARGE_INTEGER t0;
+    QueryPerformanceCounter(&t0);
     Lock lock;
-    Pump();
-    Slot& s = g_slots[idx];
+    LogIfSlow("waiting for state lock", t0);
+    const Slot& s = g_slots[idx];
     if (!s.pad) return ERROR_DEVICE_NOT_CONNECTED;
 
-    XINPUT_GAMEPAD cur = {};
-    Translate(s.pad, withGuide, cur);
-    if (std::memcmp(&cur, &s.last, sizeof(cur)) != 0) {
-        s.last = cur;
-        ++s.packet;
-    }
     st->dwPacketNumber = s.packet;
-    st->Gamepad = cur;
+    st->Gamepad = s.last;
+    if (!withGuide) st->Gamepad.wButtons &= (WORD)~XINPUT_GAMEPAD_GUIDE;
     return ERROR_SUCCESS;
 }
 
@@ -249,7 +417,6 @@ DWORD WINAPI XInputSetState(DWORD idx, XINPUT_VIBRATION* v) {
 DWORD WINAPI XInputGetCapabilities(DWORD idx, DWORD /*flags*/, XINPUT_CAPABILITIES* caps) {
     if (idx >= kMaxPads || !caps) return ERROR_BAD_ARGUMENTS;
     Lock lock;
-    Pump();
     if (!g_slots[idx].pad) return ERROR_DEVICE_NOT_CONNECTED;
     std::memset(caps, 0, sizeof(*caps));
     caps->Type = XINPUT_DEVTYPE_GAMEPAD;
