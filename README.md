@@ -6,15 +6,15 @@ and presents them to the game as Xbox 360 pads. Use it to make PlayStation,
 Switch, generic DirectInput and other SDL-supported controllers work in games
 that only understand XInput.
 
-The project also ships an optional companion, **`dinput8.dll` (dinput8-hide)**:
-a DirectInput 8 proxy that hides gamepads from the game, so it sees each pad
-only once, through XInput, instead of twice or through the wrong API.
+It can also **hide gamepads from DirectInput 8** using [MinHook](https://github.com/TsudaKageyu/minhook)
+inline hooks, so the game sees each pad only once, through XInput, instead of
+twice or through the wrong API. No separate `dinput8.dll` proxy is needed.
 
 ```
 Game  --XInputGetState-->  xinput1_3.dll (this project)  --SDL3-->  your controller
-
-Game  --DirectInput8-->    dinput8.dll (dinput8-hide)  --> real dinput8.dll
-                           (keyboard/mouse pass through; gamepads are filtered out)
+                                 |
+                                 +-- MinHook: DirectInput 8 calls in the game process
+                                     are filtered so gamepads are not enumerated/opened
 ```
 
 ## Features
@@ -30,15 +30,15 @@ Game  --DirectInput8-->    dinput8.dll (dinput8-hide)  --> real dinput8.dll
 - No work in `DllMain`; lazy, thread-safe init
 - Static CRT: no VC++ redistributable required
 
-**dinput8-hide (optional)**
+**DirectInput hiding (MinHook)**
 
-- Forwards everything to the real system `dinput8.dll`
-- Wraps `IDirectInput8A` / `IDirectInput8W` so gamepad-class devices are
-  removed from `EnumDevices` and `EnumDevicesBySemantics`
-- Blocks `CreateDevice` (returns `DIERR_DEVICENOTREG`) and `GetDeviceStatus`
-  (returns `DI_NOTATTACHED`) for hidden devices
+- Gamepad-class devices are removed from DirectInput 8 enumeration and cannot
+  be opened by the game
 - Keyboard, mouse and other non-pad devices are left untouched
-- SDL and the XInput wrapper itself are exempt, so they still see the real devices
+- Works by hooking in-process with MinHook: nothing is replaced on disk, and
+  the real system `dinput8.dll` is used as-is
+- Calls made by SDL itself are not filtered, so SDL can still see the real
+  devices that feed the XInput wrapper
 - No configuration of its own; reuses the `Debug` key from `xinput_sdl.ini`
 
 ## Quick start (using a release/CI build)
@@ -47,10 +47,8 @@ Game  --DirectInput8-->    dinput8.dll (dinput8-hide)  --> real dinput8.dll
 2. Copy the matching DLL (`xinput1_3.dll`, ...) **and `SDL3.dll`** next to the
    game's `.exe`. 32-bit game -> 32-bit build; 64-bit game -> 64-bit build.
 3. Optionally copy `xinput_sdl.ini` and `gamecontrollerdb.txt` there too.
-4. *(Optional)* If the game also enumerates the pad through DirectInput and
-   gets confused (double input, wrong button layout, wrong player), copy
-   `dinput8.dll` next to the exe as well. See [dinput8-hide](#dinput8-hide).
-5. Launch the game.
+4. Launch the game. DirectInput hiding is applied automatically from the same
+   DLL; there is nothing else to install.
 
 ### Which DLL name does the game use?
 
@@ -63,18 +61,19 @@ dumpbin /imports Game.exe | findstr /i "xinput dinput"
 (DX9-era games), `XINPUT1_4.dll` (Win8+ era), `XINPUT9_1_0.dll`. If unsure,
 place copies under several names; unused ones are harmless.
 
-If the exe imports `DINPUT8.dll` (or creates DirectInput 8 at runtime), the
-`dinput8.dll` proxy is applicable.
+The XInput DLL is what gets loaded, so it is also what carries the hooks. If
+the game never loads the XInput DLL you placed, the DirectInput hooks are not
+installed either.
 
 ## Building
 
 Requirements: CMake >= 3.15, a C++17 compiler (MSVC recommended; MinGW-w64 works),
-and SDL3 development files (SDL3 >= 3.4.0).
+SDL3 development files (SDL3 >= 3.4.0) and MinHook.
 
 ### MSVC + vcpkg
 
 ```bat
-vcpkg install sdl3:x64-windows sdl3:x86-windows
+vcpkg install sdl3:x64-windows sdl3:x86-windows minhook:x64-windows minhook:x86-windows
 
 :: 64-bit
 cmake -S . -B build64 -A x64 -DXINPUT_DLL_NAME=xinput1_3 ^
@@ -89,14 +88,15 @@ cmake -S . -B build32 -A Win32 -DXINPUT_DLL_NAME=xinput1_3 ^
 cmake --build build32 --config Release
 ```
 
-Output lands in `build*/bin/Release/` (`xinput1_3.dll`, `dinput8.dll`,
-`SDL3.dll`, `xinput_sdl.ini`, `xinput_test.exe`).
+Output lands in `build*/bin/Release/` (`xinput1_3.dll`, `SDL3.dll`,
+`xinput_sdl.ini`, `xinput_test.exe`). MinHook is linked into the DLL, so there
+is no extra runtime file for it.
 
 ### MinGW-w64 (32-bit example)
 
 ```sh
 cmake -S . -B build -G Ninja -DXINPUT_DLL_NAME=xinput1_3 \
-  -DCMAKE_PREFIX_PATH=/path/to/SDL3-3.x.y/i686-w64-mingw32
+  -DCMAKE_PREFIX_PATH="/path/to/SDL3-3.x.y/i686-w64-mingw32;/path/to/minhook"
 cmake --build build
 ```
 
@@ -107,10 +107,6 @@ cmake --build build
 | `XINPUT_DLL_NAME` | `xinput1_3` | `xinput1_3`, `xinput1_4` or `xinput9_1_0` |
 | `XINPUT_STATIC_SDL` | `OFF` | Link SDL3 statically (needs a static SDL3 package, e.g. `x64-windows-static`) |
 | `XINPUT_BUILD_TEST` | `ON` | Build `xinput_test.exe` |
-| `DINPUT8_BUILD_HIDE` | `ON` | Build the `dinput8.dll` proxy (dinput8-hide) |
-
-`dinput8.dll` does not depend on SDL and has no import library dependency on
-`dinput8.lib` or `dxguid.lib`.
 
 ## Testing without a game
 
@@ -123,13 +119,13 @@ xinput_test.exe xinput1_3.dll
 It prints live state for slots 0-3 and rumbles slot 0 proportionally to the
 triggers. (`xinput_test.exe` must have the same bitness as the DLL.)
 
-## dinput8-hide
+## DirectInput hiding
 
 Many games probe both DirectInput and XInput. With a PlayStation or Switch pad
 the game may then see the same physical controller twice (once as a DirectInput
 joystick with a generic layout, once as an XInput pad), or pick DirectInput
-and ignore XInput entirely. `dinput8.dll` removes the DirectInput side of that
-so only the XInput wrapper is left.
+and ignore XInput entirely. The hooks remove the DirectInput side of that so
+only the XInput wrapper is left.
 
 ### What is hidden
 
@@ -140,40 +136,33 @@ so only the XInput wrapper is left.
 | Generic device (`DI8DEVTYPE_DEVICE`, e.g. generic HID) | No (may not be a pad) |
 | Keyboard, Mouse, Screen pointer, Remote, ... | No |
 
-The policy is compiled in (`Config` in `src/dinput8_hide.cpp`). To change it,
-flip the `hideJoystickClass`, `hideSupplemental` or `hideGeneric` constants and
-rebuild.
+The policy is compiled in. To change it, edit the hide-policy constants in the
+source and rebuild.
 
-### Install
+### How it works
 
-Copy `dinput8.dll` (same bitness as the game) next to the game's `.exe`,
-together with the XInput wrapper and `SDL3.dll`. The proxy loads the real
-`dinput8.dll` from the Windows system directory (`SysWOW64` for 32-bit
-processes on 64-bit Windows), never itself.
+MinHook patches the DirectInput 8 entry points in the game process so the
+results seen by the game are filtered. Hidden devices are skipped during
+enumeration and cannot be created by GUID. Because the hooks live inside the
+XInput DLL, they only exist in processes that load it.
 
-### Caller exemptions
-
-When a module calls `DirectInput8Create`, the proxy checks the caller's DLL
-name. Callers whose file name starts with `sdl` or `xinput` get the unwrapped
-real interface. This matters because SDL can use DirectInput as one of its own
-joystick backends, and SDL is what feeds the XInput wrapper; hiding pads from
-it would defeat the whole setup. Everyone else, including the game exe, gets
-the filtered wrapper.
+SDL can use DirectInput as one of its own joystick backends, and SDL is what
+feeds the XInput wrapper, so calls coming from SDL are passed through
+unfiltered.
 
 ## Configuration (`xinput_sdl.ini`)
 
-| Key | Default | Used by | Description |
-|---|---|---|---|
-| `SwapAB` | `0` | xinput wrapper | Swap A/B and X/Y (Nintendo layout) |
-| `Rumble` | `1` | xinput wrapper | `0` ignores game rumble |
-| `Debug` | `0` | both | Log to `OutputDebugString` (use Sysinternals DebugView) |
+| Key | Default | Description |
+|---|---|---|
+| `SwapAB` | `0` | Swap A/B and X/Y (Nintendo layout) |
+| `Rumble` | `1` | `0` ignores game rumble |
+| `Debug` | `0` | Log to `OutputDebugString` (use Sysinternals DebugView); also logs hook activity |
 
-All keys live in the `[General]` section. `dinput8.dll` reads only `Debug`; the
-file is optional for it.
+All keys live in the `[General]` section.
 
 `gamecontrollerdb.txt` (from
 [SDL_GameControllerDB](https://github.com/mdqinc/SDL_GameControllerDB)) placed
-next to the DLL is loaded automatically by the XInput wrapper.
+next to the DLL is loaded automatically.
 
 ## Design notes
 
@@ -187,14 +176,11 @@ next to the DLL is loaded automatically by the XInput wrapper.
 - **Events:** the wrapper polls SDL's event queue for hot-plug. If the game
   *also* uses the same `SDL3.dll` in the same process, the two would share one
   event queue; in that case build with `XINPUT_STATIC_SDL=ON`.
-- **dinput8-hide wraps COM interfaces.** `IDirectInput8A` and `IDirectInput8W`
-  are each wrapped; if a game queries the other charset variant through
-  `QueryInterface`, that is wrapped too so it cannot be used to bypass the
-  filter.
-- **dinput8-hide never unloads.** `DllCanUnloadNow` always returns `S_FALSE`,
-  since wrapper objects may outlive the host's idea of what is in use.
-- **Loader lock:** neither DLL does real work in `DllMain`; both initialise
-  lazily on first use.
+- **Hooks instead of a proxy DLL:** MinHook is statically linked, so hiding
+  needs no extra file next to the game and no replacement of the system
+  `dinput8.dll`. It also means one DLL covers both XInput and DirectInput.
+- **Loader lock:** the DLL does no real work in `DllMain`; SDL and the hooks
+  are initialised lazily on first use.
 
 ## Limitations
 
@@ -202,14 +188,14 @@ next to the DLL is loaded automatically by the XInput wrapper.
   GUIDs, headset, real battery levels.
 - Games that detect Xbox pads through Raw Input / HID device paths (`IG_`) or
   load XInput by absolute path bypass this approach.
-- dinput8-hide only covers **DirectInput 8**. Older DirectInput (`dinput.dll`),
-  Raw Input, HID, WGI and SDL/GLFW running inside the game are not filtered. A
-  game-side SDL whose DLL name starts with `sdl` is exempt by design, so it
-  will still see the real pads.
-- dinput8-hide does not handle aggregation (`DirectInput8Create` with a
-  non-NULL outer object); that case is passed through unfiltered.
-- **Do not use with online games / anti-cheat**; DLL proxying is commonly
-  flagged and may get you banned. Intended for single-player use.
+- DirectInput hiding only covers **DirectInput 8**. Older DirectInput
+  (`dinput.dll`), Raw Input, HID, WGI and SDL/GLFW running inside the game are
+  not filtered.
+- Inline hooks can conflict with other software that hooks the same functions
+  (overlays, other wrappers, injectors).
+- **Do not use with online games / anti-cheat**; DLL replacement and inline
+  hooking are commonly flagged and may get you banned. Intended for
+  single-player use.
 - Windows only.
 
 ## Troubleshooting
@@ -217,16 +203,15 @@ next to the DLL is loaded automatically by the XInput wrapper.
 | Symptom | Likely cause |
 |---|---|
 | Game ignores the DLL | Wrong DLL name or bitness; check imports |
-| Game crashes at start | `SDL3.dll` missing/wrong bitness next to the exe |
+| Game crashes at start | `SDL3.dll` missing/wrong bitness next to the exe, or a conflicting hook from another tool |
 | Pad not detected | Check it in `xinput_test.exe`; add a mapping to `gamecontrollerdb.txt` |
 | Buttons mis-mapped | Fix SDL mapping, or set `SwapAB=1` |
 | No rumble | Pad/driver lacks SDL rumble support; check `Rumble=1` |
-| Pad appears twice / duplicate input | Add `dinput8.dll` (dinput8-hide); confirm the game imports DirectInput 8 |
-| Game loses its keyboard/mouse | Should not happen; enable `Debug=1` and check which device was blocked |
+| Pad appears twice / duplicate input | Confirm the game uses DirectInput 8 and loads your XInput DLL (hooks come with it) |
 | Pad still seen via DirectInput | Game uses old `dinput.dll`, Raw Input, or its own SDL (see Limitations) |
-| Pad stops working after adding `dinput8.dll` | Caller exemption not matching; with `Debug=1` check the "DirectInput8Create from ..." lines |
-| Need logs | `Debug=1` + DebugView (both DLLs log with `[xinput-sdl]` / `[dinput8-hide]` prefixes) |
+| Game loses its keyboard/mouse | Should not happen; enable `Debug=1` and check which device was filtered |
+| Need logs | `Debug=1` + DebugView (prefix `[xinput-sdl]`) |
 
 ## License
 
-MIT, see `LICENSE`.
+MIT, see `LICENSE`. 
