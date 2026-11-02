@@ -17,6 +17,7 @@ namespace {
 // IDirectInput8 vtable slots (IUnknown = 0..2)
 constexpr int kVtCreateDevice = 3;
 constexpr int kVtEnumDevices  = 4;
+constexpr int kVtEnumDevicesBySemantics = 9;
 
 // IID_IDirectInput8A / IID_IDirectInput8W (defined here to avoid linking dxguid)
 const GUID kIID_DI8A = {0xBF798030, 0x483A, 0x4DA2, {0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00}};
@@ -105,38 +106,83 @@ bool IsHidden(const GUID& g) {
 
 // ---- EnumDevices ----------------------------------------------------------
 
+// Diagnostics: the first few hooked DirectInput calls (and every device they present) are
+// logged on entry and exit, so a crash log shows which call the game was inside.
+volatile LONG g_traceCalls = 0, g_traceDevs = 0;
+struct Trace {
+    const char* what;
+    bool        on;
+    Trace(const char* w, DWORD a, DWORD b) : what(w), on(!BypassActive() && InterlockedIncrement(&g_traceCalls) <= 40) {
+        if (on) LOGI("DirectInput: > %s (arg=%lu flags=0x%lX)", what, (unsigned long)a, (unsigned long)b);
+    }
+    ~Trace() { if (on) LOGI("DirectInput: < %s returned", what); }
+};
+
 template <class Cb>
 struct EnumCtx {
     Cb      cb;
     LPVOID  user;
 };
 
+// True (and remembers the instance GUID, so CreateDevice can refuse it) when `inst`
+// is a game controller that must be hidden from the game.
+template <class Inst>
+bool HideController(const Inst* inst) {
+    if (!IsGameController(inst->dwDevType)) {
+        if (!BypassActive() && InterlockedIncrement(&g_traceDevs) <= 40) {
+            Name prod = ToName(inst->tszProductName);
+            LOGI("DirectInput: visible device '%s' type=0x%02X", prod.s, (unsigned)LOBYTE(inst->dwDevType));
+        }
+        return false;
+    }
+    if (RememberHidden(inst->guidInstance)) {
+        Name prod = ToName(inst->tszProductName);
+        Name inst_n = ToName(inst->tszInstanceName);
+        LOGI("DirectInput: hiding '%s' / '%s' type=0x%02X guid=%s",
+             prod.s, inst_n.s, (unsigned)LOBYTE(inst->dwDevType), ToStr(inst->guidInstance).s);
+    }
+    return true;
+}
+
 template <class Inst, class Cb>
 BOOL CALLBACK EnumShim(const Inst* inst, LPVOID ref) {
     auto* ctx = static_cast<EnumCtx<Cb>*>(ref);
-    if (IsGameController(inst->dwDevType)) {
-        if (RememberHidden(inst->guidInstance)) {
-            Name prod = ToName(inst->tszProductName);
-            Name inst_n = ToName(inst->tszInstanceName);
-            LOGI("DirectInput: hiding '%s' / '%s' type=0x%02X guid=%s",
-                 prod.s, inst_n.s, (unsigned)LOBYTE(inst->dwDevType), ToStr(inst->guidInstance).s);
-        }
-        return DIENUM_CONTINUE;  // swallow
-    }
+    if (HideController(inst)) return DIENUM_CONTINUE;  // swallow
     return ctx->cb(inst, ctx->user);
+}
+
+// EnumDevicesBySemantics hands the callback an already-created device object as well.
+// When hiding, that object is deliberately NOT released: whether the callback owns the
+// reference is not something we can verify, and a one-off leak is far safer than a
+// double release (same policy as the sibling project).
+template <class Inst, class Dev, class Cb>
+BOOL CALLBACK EnumSemShim(const Inst* inst, Dev* dev, DWORD flags, DWORD remaining, LPVOID ref) {
+    auto* ctx = static_cast<EnumCtx<Cb>*>(ref);
+    if (HideController(inst)) return DIENUM_CONTINUE;  // swallow
+    return ctx->cb(inst, dev, flags, remaining, ctx->user);
 }
 
 template <class Inst, class Cb, class Orig>
 HRESULT DoEnum(Orig orig, void* self, DWORD devType, Cb cb, LPVOID ref, DWORD flags) {
     if (!cb || BypassActive()) return orig(self, devType, cb, ref, flags);
+    Trace trace("EnumDevices", devType, flags);
     EnumCtx<Cb> ctx{cb, ref};
     return orig(self, devType, &EnumShim<Inst, Cb>, &ctx, flags);
+}
+
+template <class Inst, class Dev, class Cb, class Fmt, class Str, class Orig>
+HRESULT DoEnumSem(Orig orig, void* self, Str user, Fmt* fmt, Cb cb, LPVOID ref, DWORD flags) {
+    if (!cb || BypassActive()) return orig(self, user, fmt, cb, ref, flags);
+    Trace trace("EnumDevicesBySemantics", 0, flags);
+    EnumCtx<Cb> ctx{cb, ref};
+    return orig(self, user, fmt, &EnumSemShim<Inst, Dev, Cb>, &ctx, flags);
 }
 
 // ---- CreateDevice ---------------------------------------------------------
 
 template <class Dev, class Orig>
 HRESULT DoCreate(Orig orig, void* self, REFGUID guid, Dev** out, LPUNKNOWN outer) {
+    Trace trace("CreateDevice", 0, 0);
     if (!BypassActive() && IsHidden(guid)) {
         LOGI("DirectInput: CreateDevice refused for hidden device %s", ToStr(guid).s);
         if (out) *out = nullptr;
@@ -150,12 +196,16 @@ HRESULT DoCreate(Orig orig, void* self, REFGUID guid, Dev** out, LPUNKNOWN outer
 using PFN_Create   = HRESULT (WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 using PFN_EnumA    = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPDIENUMDEVICESCALLBACKA, LPVOID, DWORD);
 using PFN_EnumW    = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPDIENUMDEVICESCALLBACKW, LPVOID, DWORD);
+using PFN_EnumSemA = HRESULT (STDMETHODCALLTYPE*)(void*, LPCSTR,  LPDIACTIONFORMATA, LPDIENUMDEVICESBYSEMANTICSCBA, LPVOID, DWORD);
+using PFN_EnumSemW = HRESULT (STDMETHODCALLTYPE*)(void*, LPCWSTR, LPDIACTIONFORMATW, LPDIENUMDEVICESBYSEMANTICSCBW, LPVOID, DWORD);
 using PFN_CreateDA = HRESULT (STDMETHODCALLTYPE*)(void*, REFGUID, LPDIRECTINPUTDEVICE8A*, LPUNKNOWN);
 using PFN_CreateDW = HRESULT (STDMETHODCALLTYPE*)(void*, REFGUID, LPDIRECTINPUTDEVICE8W*, LPUNKNOWN);
 
 PFN_Create   g_origCreate = nullptr;
 PFN_EnumA    g_origEnumA = nullptr;
 PFN_EnumW    g_origEnumW = nullptr;
+PFN_EnumSemA g_origEnumSemA = nullptr;
+PFN_EnumSemW g_origEnumSemW = nullptr;
 PFN_CreateDA g_origCreateDevA = nullptr;
 PFN_CreateDW g_origCreateDevW = nullptr;
 
@@ -164,6 +214,14 @@ HRESULT STDMETHODCALLTYPE Hook_EnumDevicesA(void* self, DWORD t, LPDIENUMDEVICES
 }
 HRESULT STDMETHODCALLTYPE Hook_EnumDevicesW(void* self, DWORD t, LPDIENUMDEVICESCALLBACKW cb, LPVOID ref, DWORD f) {
     return DoEnum<DIDEVICEINSTANCEW>(g_origEnumW, self, t, cb, ref, f);
+}
+HRESULT STDMETHODCALLTYPE Hook_EnumSemA(void* self, LPCSTR user, LPDIACTIONFORMATA fmt,
+                                        LPDIENUMDEVICESBYSEMANTICSCBA cb, LPVOID ref, DWORD f) {
+    return DoEnumSem<DIDEVICEINSTANCEA, IDirectInputDevice8A>(g_origEnumSemA, self, user, fmt, cb, ref, f);
+}
+HRESULT STDMETHODCALLTYPE Hook_EnumSemW(void* self, LPCWSTR user, LPDIACTIONFORMATW fmt,
+                                        LPDIENUMDEVICESBYSEMANTICSCBW cb, LPVOID ref, DWORD f) {
+    return DoEnumSem<DIDEVICEINSTANCEW, IDirectInputDevice8W>(g_origEnumSemW, self, user, fmt, cb, ref, f);
 }
 HRESULT STDMETHODCALLTYPE Hook_CreateDeviceA(void* self, REFGUID g, LPDIRECTINPUTDEVICE8A* out, LPUNKNOWN o) {
     return DoCreate(g_origCreateDevA, self, g, out, o);
@@ -205,13 +263,16 @@ void HookObject(REFIID riid, void* obj) {
     void** vt = *reinterpret_cast<void***>(obj);
     void* enumFn   = vt[kVtEnumDevices];
     void* createFn = vt[kVtCreateDevice];
+    void* semFn    = vt[kVtEnumDevicesBySemantics];
     bool ok;
     if (isW) {
         ok  = HookOne(enumFn,   reinterpret_cast<void*>(&Hook_EnumDevicesW),   reinterpret_cast<void**>(&g_origEnumW),      "IDirectInput8W::EnumDevices");
         ok &= HookOne(createFn, reinterpret_cast<void*>(&Hook_CreateDeviceW),  reinterpret_cast<void**>(&g_origCreateDevW), "IDirectInput8W::CreateDevice");
+        ok &= HookOne(semFn,    reinterpret_cast<void*>(&Hook_EnumSemW),       reinterpret_cast<void**>(&g_origEnumSemW),   "IDirectInput8W::EnumDevicesBySemantics");
     } else {
         ok  = HookOne(enumFn,   reinterpret_cast<void*>(&Hook_EnumDevicesA),   reinterpret_cast<void**>(&g_origEnumA),      "IDirectInput8A::EnumDevices");
         ok &= HookOne(createFn, reinterpret_cast<void*>(&Hook_CreateDeviceA),  reinterpret_cast<void**>(&g_origCreateDevA), "IDirectInput8A::CreateDevice");
+        ok &= HookOne(semFn,    reinterpret_cast<void*>(&Hook_EnumSemA),       reinterpret_cast<void**>(&g_origEnumSemA),   "IDirectInput8A::EnumDevicesBySemantics");
     }
     ReleaseSRWLockExclusive(&g_lock);
     if (!ok) LOGW("DirectInput: %s interface only partially hooked", isW ? "IDirectInput8W" : "IDirectInput8A");

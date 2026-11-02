@@ -13,7 +13,7 @@ HANDLE  g_file = INVALID_HANDLE_VALUE;
 bool    g_enabled = false, g_verbose = false, g_dbgOut = false;
 char    g_path[MAX_PATH + 32] = {};
 
-const char* kFileName = "input_sdl.log";
+const char* kFileName = "xinput_sdl.log";
 
 const char* Tag(Level l) {
     switch (l) {
@@ -62,7 +62,7 @@ void Init(const char* dir, const Options& opt) {
     if (g_file != INVALID_HANDLE_VALUE) {
         LOGI("log opened: %s%s", g_path, usedTemp ? " (game folder not writable, using %TEMP%)" : "");
     } else if (opt.enabled) {
-        OutputDebugStringA("[input_sdl] could not create input_sdl.log\n");
+        OutputDebugStringA("[input_sdl] could not create xinput_sdl.log\n");
     }
 }
 

@@ -7,10 +7,10 @@
 // Hooked:
 //   dinput8!DirectInput8Create            (to reach the IDirectInput8A/W vtables)
 //   IDirectInput8A/W::EnumDevices         (game controllers are filtered out)
+//   IDirectInput8A/W::EnumDevicesBySemantics (same filter; used by action-mapping games)
 //   IDirectInput8A/W::CreateDevice        (hidden instance GUIDs are refused)
 //
-// Not hooked: EnumDevicesBySemantics / FindDevice, legacy dinput.dll, winmm
-// joy*, RawInput.
+// Not hooked: FindDevice, legacy dinput.dll, winmm joy*, RawInput.
 #pragma once
 
 namespace dinput_hide {
@@ -30,7 +30,8 @@ void Shutdown();
 // While alive on a thread, DirectInput calls made from that thread are passed
 // through unfiltered. Wrap every SDL call that may touch DirectInput
 // (SDL_Init, SDL_PumpEvents/PollEvent, SDL_OpenGamepad): SDL3's own joystick
-// backend uses DirectInput8 and would otherwise be blinded by our hooks.
+// backend uses DirectInput8 and would otherwise be blinded by our hooks. The SDL
+// worker thread simply holds one Bypass for its entire lifetime.
 struct Bypass {
     Bypass();
     ~Bypass();

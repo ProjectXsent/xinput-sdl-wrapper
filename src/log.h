@@ -1,4 +1,4 @@
-// Tiny thread-safe file logger -> input_sdl.log (next to the wrapper DLL).
+// Tiny thread-safe file logger -> xinput_sdl.log (next to the wrapper DLL).
 #pragma once
 
 #include <cstdarg>
@@ -8,7 +8,7 @@ namespace xlog {
 enum class Level { Debug, Info, Warn, Error };
 
 struct Options {
-    bool enabled = true;       // write input_sdl.log at all
+    bool enabled = true;       // write xinput_sdl.log at all
     bool verbose = false;      // include Debug lines (SDL verbose log, rumble, ...)
     bool debugOutput = false;  // also mirror to OutputDebugString (DebugView)
 };
